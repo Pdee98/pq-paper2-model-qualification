@@ -1,0 +1,8 @@
+backend,duration_ns,operation,variant,session,success
+fixture_a,1000000000,verify,valid,0,true
+fixture_a,2000000000,verify,valid,0,true
+fixture_a,3000000000,verify,valid,1,true
+fixture_a,7000000000,verify_invalid,single_bit_flip,0,true
+fixture_a,8000000000,verify_invalid,random_bytes,0,true
+fixture_other,99000000000,verify,valid,0,true
+fixture_a,88000000000,sign,valid,0,true

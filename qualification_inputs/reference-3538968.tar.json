@@ -1,0 +1,16 @@
+{
+  "commit": "3538968f79be0996cf2cc572fa33339fadf1d25f",
+  "archive_sha256": "e119a1015d653046ecb14bffa8a4ded057625f8c2600c62b4218bca7a0ec5d4b",
+  "files": {
+    "src/experiment/workload_rng.py": "63ce5d89e5ca3e3df4b615894585f25607360618f16f7e23c785a24710f15e81",
+    "src/paper2/__init__.py": "47ab4539f9bf5726cc3270c927d0bda3c7d13ab0c2ad5b12221cdad893be7d05",
+    "src/paper2/model/__init__.py": "38451d2a8bc25d170d83f2402034dd3afc5228c65b33fea13509c799665da184",
+    "src/paper2/model/dispatch_state.py": "16213ea964963214d543db3d8f8a525cce6ebf90efcac339dad18ea88a79c787",
+    "src/paper2/model/engine.py": "ecceae49a9ca5634c8132b7af4fc5dc54431ddde905f2c9121e1bc874dd621ac",
+    "src/paper2/model/service_times.py": "a45b915b150bec0b6d807d526403400cb371891a3d454743c0a8fb3a2ecbf2b9",
+    "src/paper2/model/summary.py": "7faad2cc820da6c7da250a802396975b91066b2902bbe9221971aed58ec12156",
+    "src/paper2/policies/__init__.py": "30ba74a014cc748b176136dfdc0fd3c0fe2e26b4e8518c9ff2195c5df514bdbc",
+    "src/paper2/state/__init__.py": "c8d8de65fa551e643336ee7383b0b4ce24070d2fa68b000b637dab814693c15b",
+    "src/paper2/state/core.py": "b45ba5abc15031620f3f602a303dc6d77a7c2dfac8ffb76c2b0f93f903f11b4e"
+  }
+}

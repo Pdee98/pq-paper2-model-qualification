@@ -1,0 +1,491 @@
+"""Hash-bound deterministic replay and full checking of public signed evidence."""
+
+import argparse
+from contextvars import ContextVar
+import csv
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import statistics
+import time
+
+from src.paper2.model.engine import Model, run_model, _git_state
+from src.paper2.model.service_times import JOB_CLASSES, ROOT, sha256_file
+from src.paper2.verify.invariants import check
+from .analysis import BANDS, CapturedService, compare, costs, metrics, samples_from_jobs
+from . import public_corpus
+from .replay_progress import tracked_run, stage, owns_output, record_source_commit
+from ..verify.observer import emit
+from .replay_budget import matrix_entry
+from .validity import from_events as prototype_validity
+
+DIAGNOSTIC_REHEARSAL = ContextVar("paper2_diagnostic_rehearsal", default=False)
+SCHEMA="paper2-g3-replay-v1"
+PENDING="prototype-complete: replay pending"
+EXCLUSION="dispatcher-bound, not a valid worker-contention test"
+
+
+def save(path,value):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_bytes(json.dumps(value,separators=(",",":")).encode()+b"\n")
+
+
+def read(path):return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def safe_file(root,name):
+    rel=PurePosixPath(name)
+    if not name or rel.is_absolute() or ".." in rel.parts or "\\" in name or ":" in name:
+        raise ValueError("unsafe replay path")
+    root=Path(root).resolve();path=root/Path(*rel.parts)
+    if path.is_symlink() or root not in path.resolve().parents:raise ValueError("unsafe replay file")
+    return path
+
+
+def audit_value(value):
+    if isinstance(value,dict):
+        for name,item in value.items():
+            key=name.lower()
+            if ("private" in key or "secret" in key or key in
+                    ("signing_state","presigning","leaf_index","next_leaf","signature_hex","payload_hex","public_key_hex","token")):
+                raise ValueError("private material or signing state in replay input")
+            audit_value(item)
+    elif isinstance(value,list):
+        for item in value:audit_value(item)
+    elif isinstance(value,str) and ("PRIVATE"+" KEY") in value.upper():
+        raise ValueError("private material in replay input")
+
+
+def audit_file(path):
+    if path.name=="public-corpus.zip":
+        public_corpus.validate_archive(path);return
+    if path.name.lower().startswith(".env") or path.suffix.lower() in (".pem",".key",".p12",".pfx"):
+        raise ValueError("private material filename in replay input")
+    if path.suffix==".json":audit_value(read(path))
+    elif path.name=="jobs.csv":
+        with path.open(newline="",encoding="utf-8") as stream:
+            for row in csv.DictReader(stream):audit_value(json.loads(row["record"]))
+    carry=b""
+    with path.open("rb") as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b""):
+            raw=carry+chunk
+            if (b"PRIVATE"+b" KEY") in raw.upper():raise ValueError("private material in replay input")
+            carry=raw[-32:]
+
+
+def seal(directory,name,extra=None):
+    directory=Path(directory)
+    files=[dict(path=p.relative_to(directory).as_posix(),sha256=sha256_file(p))
+           for p in sorted(directory.rglob("*")) if p.is_file() and p not in (directory/name,directory/(name+".sha256"))]
+    manifest=dict(schema=SCHEMA,files=files,**(extra or {}))
+    if name=='RESULT_MANIFEST.json' and 'provenance' not in manifest:
+        from .replay_progress import result_provenance
+        # Read any existing receipt before replacing the manifest.
+        manifest['provenance']=result_provenance(directory)
+    save(directory/name,manifest)
+    (directory/(name+".sha256")).write_bytes((sha256_file(directory/name)+"\n").encode())
+    return manifest
+
+
+def verify_files(directory,name):
+    from .input_trust import reject
+    reject(directory)
+    directory=Path(directory);path=directory/name
+    if sha256_file(path)!=(directory/(name+".sha256")).read_text().strip():raise ValueError("replay manifest SHA-256 mismatch")
+    data=read(path);seen=set()
+    if data["schema"]!=SCHEMA:raise ValueError("unsupported replay schema")
+    for file_index, row in enumerate(data["files"]):
+        file=safe_file(directory,row["path"])
+        if row["path"] in seen or sha256_file(file)!=row["sha256"]:raise ValueError("replay payload SHA-256 mismatch: "+row["path"])
+        seen.add(row["path"])
+        emit("input hashes", files_verified=file_index+1, total_files=len(data["files"]))
+    actual={p.relative_to(directory).as_posix() for p in directory.rglob("*") if p.is_file()}
+    if actual!=seen|{name,name+".sha256"}:raise ValueError("unlisted or missing replay files")
+    return data
+
+
+def cell_map(index):
+    return dict(zip(index.get("cell_ids",range(len(index["cells"]))),index["cells"]))
+
+
+def initialize(root,cells,excluded,code_commit,source_run_id,cell_ids=None):
+    root=Path(root)
+    if root.exists():raise FileExistsError("replay input root must be new")
+    if not re.fullmatch(r"[0-9a-f]{40}",code_commit):raise ValueError("full source bundle commit required")
+    root.mkdir(parents=True)
+    runs=[dict(run_id=('secondary-regime' if cell.get('role')=='secondary' else f"cell{i}-r{rep}"),cell_id=i,replicate=rep,manifest_sha256=None)
+          for i,cell in zip(cell_ids if cell_ids is not None else range(len(cells)),cells) if cell["dispatcher_utilisation"]<=.5 for rep in range(1 if cell.get('role')=='secondary' else 3)]
+    index=dict(schema=SCHEMA,code_commit=code_commit,source_run_id=str(source_run_id),
+               cells=cells,excluded_cells=excluded,runs=runs,status="prototype collection in progress")
+    if cell_ids is not None:index["cell_ids"]=list(cell_ids)
+    write_index(root,index)
+    return index
+
+
+def write_index(root,index):
+    save(Path(root)/"INDEX.json",index)
+    (Path(root)/"INDEX.sha256").write_bytes((sha256_file(Path(root)/"INDEX.json")+"\n").encode())
+
+
+def verify_index(root,source_run_id=None,complete=True):
+    from .input_trust import reject
+    reject(root)
+    root=Path(root);index=read(root/"INDEX.json")
+    if str(index.get("purpose","")).startswith("DIAGNOSTIC") and not DIAGNOSTIC_REHEARSAL.get():raise ValueError("DIAGNOSTIC inputs excluded from G3 assessment")
+    if sha256_file(root/"INDEX.json")!=(root/"INDEX.sha256").read_text().strip():raise ValueError("replay index SHA-256 mismatch")
+    if index["schema"]!=SCHEMA or not re.fullmatch(r"[0-9a-f]{40}",index["code_commit"]):raise ValueError("invalid replay index provenance")
+    if source_run_id is not None and index["source_run_id"]!=str(source_run_id):raise ValueError("source run identity mismatch")
+    cells=cell_map(index)
+    if len(cells)!=len(index['cells']) or any(isinstance(i,bool) or not isinstance(i,int) or i<0 for i in cells):raise ValueError('invalid global cell identities')
+    followup=index.get('followup_cells',[])
+    if len(set(followup))!=len(followup) or any(isinstance(i,bool) or not isinstance(i,int) or i not in cells or cells[i].get('role')=='secondary' for i in followup):raise ValueError('invalid follow-up cell list')
+    expected={('secondary-regime' if c.get('role')=='secondary' else f"cell{i}-r{r}"):(i,r) for i,c in cells.items() if c["dispatcher_utilisation"]<=.5 for r in range(1 if c.get('role')=='secondary' or DIAGNOSTIC_REHEARSAL.get() and str(index.get('purpose','')).startswith('DIAGNOSTIC') else (4 if i in followup else 3))}
+    excluded=[dict(cell=c,reason=EXCLUSION) for c in index["cells"] if c["dispatcher_utilisation"]>.5]
+    if index["excluded_cells"]!=excluded:raise ValueError("exclusion/guard mismatch")
+    required={rid for rid,(i,rep) in expected.items() if cells[i].get('role')!='secondary'}
+    actual={r['run_id'] for r in index['runs']}
+    if not expected or len(actual)!=len(index['runs']) or not required<=actual or not actual<=set(expected):raise ValueError('missing/duplicate expected repetitions')
+    seen=set()
+    for run in index["runs"]:
+        rid=run["run_id"]
+        if rid in seen or expected.get(rid)!=(run["cell_id"],run["replicate"]):raise ValueError("unexpected replay repetition")
+        seen.add(rid)
+        if complete and cells[run['cell_id']].get('role')!='secondary' and not re.fullmatch(r"[0-9a-f]{64}",run.get("manifest_sha256") or ""):
+            raise ValueError("missing replay repetition: "+rid)
+    if complete and index["status"]!=PENDING:raise ValueError("prototype collection is incomplete")
+    return index
+
+
+def create_packet(directory,config,corpus_path,prototype,held_out,cell,replicate,window=(30,90),shared_public=None,primary=None):
+    """Copy public inputs/evidence only; check privacy before creating payloads."""
+    directory=Path(directory);doc=read(corpus_path);meta=read(prototype["manifest"])
+    if meta.get("prototype",{}).get("mode")!="real-time-v1" or meta["config"].get("prototype",{}).get("mode")!="real-time-v1":
+        raise ValueError("native prototype-mode evidence required")
+    if sha256_file(Path(corpus_path))!=meta["prototype"]["corpus_sha256"]:raise ValueError("prototype corpus checksum mismatch")
+    if config.get("replicate",0)!=replicate or meta["config"]["replicate"]!=replicate:
+        raise ValueError("prototype repetition mismatch")
+    if sha256_file(Path(prototype["events"]))!=meta["event_log_sha256"] or sha256_file(Path(prototype["events"]).parent/"jobs.csv")!=meta["job_records"]["sha256"]:
+        raise ValueError("prototype event/job checksum mismatch")
+    keys={name:dict(cache_key=e["cache_key"],size_bytes=doc["workload"]["transactions"][name]["size_bytes"])
+          for name,e in doc["transactions"].items()}
+    info=dict(cell=cell,replicate=replicate,backend=doc["backend"],mapped=costs(meta),seeds=meta["seeds"],window=list(window),
+        source_commit=meta["git"]["commit"],corpus_sha256=meta["prototype"]["corpus_sha256"],
+        prototype_checks=dict(mode="prototype",status="pending deterministic replay",
+            provenance="compact public artifact hash-verified before full checker; raw signature-ID and wire-Merkle derivations audited on ARM"))
+    values={"config.json":config,"workload.json":doc["workload"],"keys.json":keys,
+            "info.json":info}
+    originals={"prototype/events.csv":Path(prototype["events"]),
+        "prototype/jobs.csv":Path(prototype["events"]).parent/"jobs.csv",
+        "prototype/manifest.json":Path(prototype["manifest"]),
+        "prototype/dispatcher_spans.json":Path(prototype["manifest"]).parent/meta["prototype"]["spans"]["path"],
+        "held-out.csv":Path(held_out)}
+    if primary is not None:
+        from .calibration_split import verify_slots
+        verify_slots(primary,held_out)
+        originals['primary.csv']=Path(primary)
+        info['calibration_slots']=dict(primary=[0,1],held_out=[2],rate_stationarity=[0,1,2])
+    progress=Path(prototype["events"]).parent/"progress.jsonl"
+    if progress.is_file():originals["prototype/progress.jsonl"]=progress
+    for name in ("gc_pauses.json","long_spans.json","gc_state.json","memory-stop.json"):
+        path=Path(prototype["events"]).parent/name
+        if path.is_file():originals["prototype/"+name]=path
+        elif name in ('gc_pauses.json','long_spans.json') and meta["prototype"].get("pause_attribution") and (name=='gc_pauses.json' or meta['prototype']['pause_attribution'].get('detailed',True)):
+            raise ValueError("missing pause attribution evidence: "+name)
+    callback_cost=Path(prototype["events"]).parent/"callback_overhead.json"
+    if callback_cost.is_file():originals["prototype/callback_overhead.json"]=callback_cost
+    for worker_path in sorted(Path(prototype['events']).parent.glob('worker-*/*.json')):
+        originals['prototype/'+worker_path.parent.name+'/'+worker_path.name]=worker_path
+    # Preserve every runtime output, including diagnostic binary pause buffers.
+    for extra in sorted(Path(prototype["manifest"]).parent.rglob("*")):
+        if extra.is_file():
+            rel="prototype/"+extra.relative_to(Path(prototype["manifest"]).parent).as_posix()
+            originals.setdefault(rel,extra)
+    for value in values.values():audit_value(value)
+    for path in originals.values():audit_file(path)
+    for sample in ([held_out,primary] if primary is not None else [held_out]):
+        with Path(sample).open(newline="",encoding="utf-8") as stream:
+            for row in csv.DictReader(stream):
+                source=(f"concurrency-cycle-k{cell['k']}-rep" if cell.get('g3_input_version')==6 else f"concurrency-k{cell['k']}-rep")
+                if not row["backend"].startswith(doc["backend"]+":") or not row.get("source","").startswith(source):
+                    raise ValueError("held-out calibration backend/k mismatch")
+    if directory.exists():raise FileExistsError("replay packet already exists")
+    directory.mkdir(parents=True)
+    existing=public_corpus.inventory(directory.parent)["files"]
+    destination=directory/'prototype/public-corpus.zip'
+    if shared_public is not None:
+        destination=safe_file(directory.parent,shared_public);info['public_corpus_ref']=shared_public
+    if destination.exists():
+        info['public_corpus']=public_corpus.validate_archive(destination)
+        import zipfile
+        from .compact import unpack
+        with zipfile.ZipFile(destination) as archive:prior=unpack(archive.read('corpus.bin'))
+        if prior['arm_audit']['full_corpus_sha256']!=meta['prototype']['corpus_sha256']:raise ValueError('shared compact corpus differs from full corpus')
+    else:info["public_corpus"]=public_corpus.write_archive(doc,destination,existing,full_path=corpus_path)
+    from .compact import audit_full
+    info["arm_corpus_audit"]=audit_full(doc,corpus_path)
+    for name,value in values.items():save(directory/name,value)
+    for name,path in originals.items():
+        target=directory/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(path,target)
+    if cell.get('g3_input_version')==6:
+        if primary is None:shutil.copyfile(held_out,directory/'primary.csv')
+        info['service_input']=('Deviation 7: fresh-process calibration reps 1-2 primary; rep 3 held-out; all three for rates/stationarity'
+                               if primary is not None else 'historical Deviation 6 identical comparison slots')
+        save(directory/'info.json',info)
+    else:samples_from_jobs(originals["prototype/jobs.csv"],directory/"primary.csv",doc["backend"],"validation")
+    for path in directory.rglob("*"):
+        if path.is_file():audit_file(path)
+    seal(directory,"REPLAY_MANIFEST.json")
+    return sha256_file(directory/"REPLAY_MANIFEST.json")
+
+
+def packet(root,index,run):
+    directory=safe_file(root,run["run_id"])
+    if sha256_file(directory/"REPLAY_MANIFEST.json")!=run["manifest_sha256"]:raise ValueError("repetition manifest SHA-256 mismatch")
+    verify_files(directory,"REPLAY_MANIFEST.json")
+    info=read(directory/"info.json")
+    if info["source_commit"]!=index["code_commit"] or info["cell"]!=run.get("cell",cell_map(index)[run["cell_id"]]) or info["replicate"]!=run["replicate"]:
+        raise ValueError("repetition provenance mismatch")
+    return directory,info
+
+
+def verify(root,source_run_id=None):
+    from .artifact_integrity import verify_if_present
+    checksums=verify_if_present(root)
+    index=verify_index(root,source_run_id)
+    allowed={"INDEX.json","INDEX.sha256"}
+    if checksums is not None:allowed.add('SHA256SUMS')
+    for receipt in index.get('source_receipts',[]):
+        file=safe_file(root,receipt['path'])
+        if sha256_file(file)!=receipt['sha256']:raise ValueError('source receipt checksum mismatch')
+        allowed.add(receipt['path'])
+    for run in index["runs"]:
+        if cell_map(index)[run['cell_id']].get('role')=='secondary' and not run.get('manifest_sha256'):continue
+        directory,info=packet(root,index,run)
+        if info.get('public_corpus_ref'):
+            reference=safe_file(root,info['public_corpus_ref']);public_corpus.validate_archive(reference,info['public_corpus'])
+            allowed.add(info['public_corpus_ref'])
+        for path in directory.rglob("*"):
+            if path.is_file():audit_file(path)
+        allowed.update(p.relative_to(root).as_posix() for p in directory.rglob("*") if p.is_file())
+    actual={p.relative_to(root).as_posix() for p in Path(root).rglob("*") if p.is_file()}
+    if actual!=allowed:raise ValueError("unlisted replay input files")
+    return index
+
+
+class ReplayModel(Model):
+    def __init__(self,config,directory,sample):
+        self.directory=Path(directory);self.keys=read(self.directory/"keys.json")
+        if config.get('g3_input_version')==6:
+            info=read(self.directory/'info.json')
+            archive=(safe_file(self.directory.parent,info['public_corpus_ref']) if info.get('public_corpus_ref') else self.directory/'prototype/public-corpus.zip')
+            public_corpus.validate_archive(archive,info['public_corpus'])
+            import zipfile
+            from .compact import unpack,expand
+            with zipfile.ZipFile(archive) as z:public=expand(unpack(z.read('corpus.bin')))
+            computed={name:dict(cache_key=e['cache_key'],size_bytes=public['workload']['transactions'][name]['size_bytes']) for name,e in public['transactions'].items()}
+            if computed!=self.keys:raise ValueError('replay key table differs from recomputed compact v2 keys')
+            if public['workload']['transactions']!=config['transactions'] or public['workload']['blocks']!=config['blocks']:raise ValueError('replay compact workload mismatch')
+            self.keys=computed
+        from .cycle_protocol import model_config
+        super().__init__(model_config(config))
+        self.config.update({k:v for k,v in config.items() if k not in model_config(config)})
+        self.service=CapturedService(sample,read(self.directory/"info.json")["backend"])
+        self.config["prototype"]=dict(mode="precomputed-key-replay-v1")
+    def _log(self, *args, **kwargs):
+        value = super()._log(*args, **kwargs)
+        if self.row_count % 4096 == 0:
+            emit("simulation", events_processed=self.row_count, jobs_created=len(self.jobs), simulation_t=self.t)
+        return value
+    def _key(self,tx):return self.keys[tx["tx_id"]]["cache_key"]
+    def extra_manifest(self,directory):
+        return dict(prototype=dict(mode="precomputed-key-replay-v1",**{
+            name:dict(path=os.path.relpath(self.directory/file,directory),sha256=sha256_file(self.directory/file))
+            for name,file in (("workload","workload.json"),("keys","keys.json"))}))
+
+
+def simulate(directory,sample,output):
+    config=read(Path(directory)/"config.json");info=read(Path(directory)/"info.json")
+    config.update(output="full",output_dir=str(output),**{name:info["mapped"][name] for name in ("structural_cost","state_cost")},
+                  service=dict(mode="constant",seconds={c:dict(valid=0,bit_flip=0,random_bytes=0) for c in JOB_CLASSES}))
+    return run_model(config,model_type=lambda c:ReplayModel(c,directory,sample))
+
+
+def postprocess_prototype(directory,output):
+    directory=Path(directory)
+    stage("prototype input verification",verify_files,directory,"REPLAY_MANIFEST.json")
+    info=read(directory/"info.json")
+    manifest=stage("compact corpus decode and relocation",public_corpus.checker_manifest,directory,output)
+    events,jobs=directory/"prototype/events.csv",directory/"prototype/jobs.csv"
+    violations=stage("prototype invariant checker",check,events,jobs,manifest)
+    config=read(directory/'config.json')
+    if config.get('g3_input_version')==6:
+        from .cycle_validity import from_logs
+        validity=stage('count-aware validity',from_logs,events,jobs,config,manifest,info['window'])
+    else:validity=stage('prototype validity',prototype_validity,events,config,info['window'])
+    memory_stop=directory/'prototype/memory-stop.json'
+    if memory_stop.is_file():
+        validity.update(passed=False,memory_guard=dict(status='INVALID',receipt=read(memory_stop)))
+    elif read(directory/'prototype/manifest.json').get('prototype',{}).get('gc_control'):
+        from .gc_control import memory_failures
+        state=directory/'prototype/gc_state.json'
+        transitions=read(state)['transitions'] if state.is_file() else []
+        samples=[r for r in (json.loads(line) for line in (directory/'prototype/progress.jsonl').read_text().splitlines()) if r.get('phase')=='memory']
+        failures=[]
+        for sample in samples:
+            failures.extend(memory_failures(sample))
+            if sample.get('invalid'):failures.append('recorded INVALID memory sample')
+        entries=[r for r in transitions if r['phase']=='loop_entry']
+        drains=[r for r in transitions if r['phase']=='drain_end']
+        if not samples or len(entries)!=1 or len(drains)!=1:failures.append('missing GC/memory evidence')
+        if any(r['enabled'] or r['frozen_count']<1 for r in entries+drains):failures.append('GC window state mismatch')
+        if failures:validity['passed']=False
+        validity['memory_guard']=dict(passed=not failures,samples=len(samples),failures=failures)
+    return dict(metrics=stage("prototype metrics",metrics,events,jobs,manifest,*info["window"]),violations=violations,
+                validity=validity,
+                input_sha256=sha256_file(directory/"REPLAY_MANIFEST.json"))
+
+
+@tracked_run
+def execute(root,run_id,output,source_run_id=None):
+    root=Path(root);output=Path(output)
+    index=stage("input index verification",verify_index,root,source_run_id)
+    if os.environ.get("GITHUB_ACTIONS")=="true" and _git_state()["commit"]!=index["code_commit"]:
+        raise ValueError("replay checkout differs from recorded source commit")
+    run=next((r for r in index["runs"] if r["run_id"]==run_id),None)
+    if run is None:raise ValueError("unknown replay repetition")
+    directory,info=stage("input packet verification",packet,root,index,run)
+    record_source_commit(index['code_commit'])
+    if output.exists() and not owns_output(output):raise FileExistsError("replay outputs must be new")
+    if output.resolve()==ROOT or ROOT in output.resolve().parents:raise ValueError("replay outputs must be outside checkout")
+    output.mkdir(parents=True,exist_ok=owns_output(output))
+    result=dict(run_id=run_id,cell_id=run["cell_id"],replicate=run["replicate"],cell=info["cell"],
+        code_commit=index["code_commit"],source_run_id=run.get("source_run_id",index["source_run_id"]),input_sha256=run["manifest_sha256"],
+        seeds=info["seeds"])
+    try:
+        result["prototype"]=stage("prototype post-processing",postprocess_prototype,directory,output/"prototype-check")
+        if read(directory/'config.json').get('g3_input_version')==6:
+            from .measurement_conditions import apply
+            stage('production measurement conditions',apply,result['prototype'],directory,info['window'])
+        if not result["prototype"]["validity"]["passed"] and info['cell'].get('role')!='secondary':
+            result["status"]="INVALID: prototype validity guard"
+            save(output/"result.json",result);seal(output,"RESULT_MANIFEST.json")
+            return result
+        for name,sample in (("primary","primary.csv"),("held_out","held-out.csv")):
+            begin=time.perf_counter();e,m=stage(name+" simulation",simulate,directory,directory/sample,output/name)
+            if read(m)["seeds"]!=info["seeds"]:raise ValueError("replay seed derivation differs from prototype")
+            sim=dict(metrics=stage(name+" metrics",metrics,e,e.parent/"jobs.csv",m,*info["window"]),
+                     violations=stage(name+" invariant checker",check,e,e.parent/"jobs.csv",m),elapsed=time.perf_counter()-begin)
+            result[name]=sim
+            if info['cell'].get('role')!='secondary':result[name+"_comparison"]=stage(name+" comparison",compare,result["prototype"]["metrics"],sim["metrics"],diagnostic=name=="held_out")
+    except Exception as exc:result["execution_error"]=str(exc)
+    save(output/"result.json",result);seal(output,"RESULT_MANIFEST.json")
+    return result
+
+
+def gather_records(index,records):
+    from .g3_decision import gather_records as decide
+    return decide(index,records)
+
+
+def gather(root,results,output,source_run_id=None):
+    output=Path(output);results=Path(results)
+    if output.resolve()==ROOT or ROOT in output.resolve().parents:raise ValueError("gather outputs must be outside checkout")
+    output.mkdir(parents=True,exist_ok=True);errors=[];records=[];index=None
+    try:
+        index=verify_index(root,source_run_id,complete=False)
+        if os.environ.get("GITHUB_ACTIONS")=="true" and _git_state()["commit"]!=index["code_commit"]:
+            errors.append(dict(check="replay checkout differs from recorded source commit"))
+        try:verify(root,source_run_id)
+        except (OSError,ValueError,KeyError) as exc:errors.append(dict(check="input checksum/schema",detail=str(exc)))
+        for path in sorted(Path(results).rglob("result.json")):
+            try:
+                verify_files(path.parent,"RESULT_MANIFEST.json");result=read(path)
+                run=next((r for r in index["runs"] if r["run_id"]==result.get("run_id")),None)
+                if run is not None:
+                    directory,info=packet(root,index,run)
+                    receipt=result.get("prototype",{}).get("input_sha256")
+                    if receipt!=run["manifest_sha256"] or result.get("seeds")!=info["seeds"]:
+                        raise ValueError("result differs from recorded prototype evidence/seeds")
+                records.append(result)
+            except (OSError,ValueError,KeyError) as exc:errors.append(dict(check="result checksum/schema",path=path.parent.name,detail=str(exc)))
+        report=gather_records(index,records);report["failures"].extend(errors)
+        if errors:report.update(status="failed",verdict="FAIL")
+    except (OSError,ValueError,KeyError) as exc:
+        report=dict(status="failed",verdict="FAIL",failures=[dict(check="input checksum/schema",detail=str(exc))],per_repetition=[],aggregates=[],excluded_cells=[])
+    for path in results.rglob('result.json'):
+        try:
+            data=read(path);verify_files(path.parent,'RESULT_MANIFEST.json')
+            destination=safe_file(output,'cells/'+data['run_id'])
+            shutil.copytree(path.parent,destination)
+        except (OSError,ValueError,KeyError):
+            # Errors remain in the aggregate; never authenticate an unchecked copy.
+            pass
+    save(output/"G3_STATUS.json",report)
+    if index is not None:
+        shutil.copyfile(Path(root)/'INDEX.json',output/'INPUT_INDEX.json')
+        shutil.copyfile(Path(root)/'INDEX.sha256',output/'INPUT_INDEX.sha256')
+        for receipt in index.get('source_receipts',[]):
+            source=safe_file(root,receipt['path']);destination=safe_file(output,receipt['path'])
+            destination.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(source,destination)
+    lines=["# G3 deterministic replay outcome","","Status: "+report["status"],"",
+           "| Run | Metric | Prototype | Primary | Error | Limit | Passed | Held-out error (diagnostic) |",
+           "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for row in report["per_repetition"]:
+        for name,item in row.get("primary",{}).get("checks",{}).items():
+            lines.append("| "+" | ".join(str(x) for x in (row["run_id"],name,item["prototype"],item["simulation"],item["error"],item["limit"],item["passed"],row["held_out"]["checks"][name]["error"]))+" |")
+    lines.extend(("","## Per-cell aggregates","",json.dumps(report["aggregates"],indent=2),
+                  "","## Secondary regime (qualitative, excluded from primary G3 bands)","",
+                  json.dumps(report.get("secondary_regime",[]),indent=2),
+                  "","## Prototype validity (INVALID repetitions have no G3 comparison)","",
+                  json.dumps([{k:r.get(k) for k in ("run_id","status","prototype_validity")} for r in report["per_repetition"]],indent=2),
+                  "","## Deviation 2 exclusions","",json.dumps(report["excluded_cells"],indent=2),
+                  "","## Every failing check","",json.dumps(report["failures"],indent=2)))
+    (output/"G3_REPORT.md").write_bytes(("\n".join(lines)+"\n").encode())
+    seal_aggregate(output,report.get('code_commit'))
+    return report
+
+
+def seal_aggregate(output,source_commit):
+    from .replay_progress import checkout_receipt
+    seal(output,'RESULT_MANIFEST.json',dict(provenance=dict(source_code_commit=source_commit,**checkout_receipt())))
+    return verify_aggregate(output,source_commit)
+
+
+def verify_aggregate(output,source_commit=None):
+    from .input_trust import reject
+    reject(output)
+    output=Path(output)
+    if not (output/'RESULT_MANIFEST.json').is_file():raise ValueError('aggregate is unsealed')
+    manifest=verify_files(output,'RESULT_MANIFEST.json')
+    receipt=manifest.get('provenance',{})
+    if not all(k in receipt for k in ('source_code_commit','replay_code_commit','replay_tree_clean')):raise ValueError('aggregate provenance missing')
+    if source_commit is not None and receipt['source_code_commit']!=source_commit:raise ValueError('aggregate source commit mismatch')
+    return manifest
+
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument("command",choices=("prepare","run","gather"))
+    p.add_argument("--inputs",type=Path,required=True);p.add_argument("--source-run-id",required=True)
+    p.add_argument("--run-id");p.add_argument("--results",type=Path);p.add_argument("--output",type=Path)
+    args=p.parse_args()
+    if not re.fullmatch(r"[0-9]+",args.source_run_id):p.error("source_run_id must be numeric")
+    from .artifact_integrity import verify_checksums
+    verify_checksums(args.inputs)
+    if args.command=="prepare":
+        index=verify(args.inputs,args.source_run_id)
+        matrix=json.dumps(dict(include=[matrix_entry(args.inputs,r["run_id"]) for r in index["runs"] if r.get("manifest_sha256")]),separators=(",",":"))
+        print(matrix)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as stream:
+                stream.write("matrix="+matrix+"\ncode_commit="+index["code_commit"]+"\n")
+    elif args.command=="run":
+        result=execute(args.inputs,args.run_id,args.output,args.source_run_id)
+        index=verify_index(args.inputs,args.source_run_id)
+        raise SystemExit(1 if result.get("execution_error") else 0)
+    else:raise SystemExit(0 if gather(args.inputs,args.results,args.output,args.source_run_id)["status"]=="passed" else 1)
+
+
+if __name__=="__main__":main()

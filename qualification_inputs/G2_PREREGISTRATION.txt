@@ -1,0 +1,15 @@
+# Paper 2 Phase 4 verification
+
+## Pre-registered G2 method (written before analytical execution)
+
+The following rule is fixed before running Part C. No confidence level, seeds, horizon, selector or acceptance threshold will be adjusted after seeing agreement outcomes. A failed gate is reported for author review.
+
+- Thirty independent replicates per configuration, with replicate-indexed SHA-256 seeds. Master identity: paper2-g2-v1. FIFO admission utilizations .3 and .6. Non-preemptive priority: block utilization .2, admission utilization .2 or .4. k=1; zero structural/state costs; no cache, pool or coalescing effects.
+- One protected primary selector: ARM64 rep1, backend ml_dsa_44, operation verify, variant valid. E[S] and E[S^2] use precisely those selected raw rows, equally weighted; durations are seconds. No pooling with another host/session/backend.
+- Fixed generation horizon T=26000/minimum positive class arrival rate, designed for at least 20,000 post-warm-up completed jobs per class. Stop arrivals at T and drain all jobs. Discard enqueue times before .1T. If a replicate fails the 20,000 requirement, report failure rather than extend/tune that replicate.
+- Mean waits use jobs enqueued in [.1T,T]. Confidence intervals are Student-t, two-sided 99%, across the 30 replicate means (df=29; critical value 2.756385903670335). Each analytical value must lie inside its class/configuration interval.
+- FIFO analytical wait: lambda E[S^2]/(2(1-rho)). Priority: W0=(lambda_block+lambda_admission)E[S^2]/2; W_block=W0/(1-rho_block); W_admission=W0/((1-rho_block)(1-rho_block-rho_admission)).
+- Little's law per replicate/class: integrate queue-wait intervals clipped to [.1T,T] for mean number waiting; compare with observed arrival rate N/(.9T) times full mean wait of that arrival cohort. Require relative difference <=2%. Boundary carry-in/carry-out is reported through that difference, not removed by an algebraic identity. Every replicate/class value is reported.
+- Part C stops if projected or actual execution exceeds 1,800 CPU seconds; wall time is also conservatively capped at 1,800 seconds. A6 and the unit suite are separate invocations. Their elapsed times are code-cost checks, not research results.
+
+Status before execution: G1/G2 UNVERIFIED. Execution evidence and outcomes will be appended below.
