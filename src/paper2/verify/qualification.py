@@ -21,6 +21,9 @@ def stage(name,work,receipts,smoke=False):
     work=Path(work);receipts=Path(receipts);work.mkdir(parents=True,exist_ok=True);receipts.mkdir(parents=True,exist_ok=True)
     if name=='scale':return scale(work,receipts,count=32 if smoke else 117292,smoke=smoke)
     if name=='phase-c':return regression(unpack_reference(Path.cwd(),work/'reference'),work,receipts,smoke=smoke)
+    if name=='de-capture':
+        from .qualification_capture import scale as capture_scale
+        return capture_scale(work,receipts,count=12 if smoke else 117292,smoke=smoke)
     if smoke:raise ValueError('G2 has no shortened qualification path')
     target=receipts/'g2.json'
     subprocess.run([sys.executable,'-B','-m','src.paper2.verify.gate4b','--summary',str(target.resolve())],check=True)
@@ -47,7 +50,7 @@ def monitor(name,work,receipts,smoke=False):
     verify(Path.cwd());save(receipts/'host.json',host())
     command=['/usr/bin/time','-v','-o',str(receipts/'time-v.txt'),sys.executable,'-B','-m',__name__ if __name__!='__main__' else 'src.paper2.verify.qualification',
         'child',name,'--work',str(work),'--receipts',str(receipts)]+(['--smoke'] if smoke else [])
-    begin=time.monotonic();peak=0;cpu={};samples=0;reason=None;wall_limit={'scale':6900,'phase-c':10500,'g2':6900}[name]
+    begin=time.monotonic();peak=0;cpu={};samples=0;reason=None;wall_limit={'scale':6900,'phase-c':10500,'g2':6900,'de-capture':6900}[name]
     with (work/'stage.log').open('wb') as log:
         p=subprocess.Popen(command,start_new_session=True,stdout=log,stderr=subprocess.STDOUT)
         while p.poll() is None:
@@ -55,6 +58,9 @@ def monitor(name,work,receipts,smoke=False):
             for pid,(_,seconds) in values.items():cpu[pid]=max(cpu.get(pid,0),seconds)
             if time.monotonic()-begin>wall_limit:reason='wall watchdog'
             if name=='g2' and sum(cpu.values())>5400:reason='90 CPU-minute watchdog'
+            if name=='de-capture':
+                available=int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')))*1024
+                if any(rss>12*1024**3 for rss,_ in values.values()) or available<2*1024**3:reason='capture scale memory guard'
             if reason:os.killpg(p.pid,signal.SIGTERM);p.wait(timeout=15);break
             if samples%30==1:print(json.dumps(dict(stage=name,wall_seconds=time.monotonic()-begin,peak_group_rss_bytes=peak,cpu_seconds_sampled=sum(cpu.values()))),flush=True)
             time.sleep(1)
@@ -73,7 +79,7 @@ def monitor(name,work,receipts,smoke=False):
     if result['status']!='passed':raise SystemExit(1)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['monitor','child','verify']);p.add_argument('stage',nargs='?',choices=['scale','phase-c','g2'])
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['monitor','child','verify']);p.add_argument('stage',nargs='?',choices=['scale','phase-c','g2','de-capture'])
     p.add_argument('--work',type=Path);p.add_argument('--receipts',type=Path);p.add_argument('--smoke',action='store_true');a=p.parse_args()
     if a.action=='verify':verify(Path.cwd());return
     if not a.stage or not a.work or not a.receipts:p.error('stage, work and receipts required')

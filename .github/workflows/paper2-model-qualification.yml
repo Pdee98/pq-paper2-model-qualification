@@ -87,3 +87,31 @@ jobs:
           name: model-qualification-g2-${{ github.run_id }}
           path: ${{ runner.temp }}/receipts/
           if-no-files-found: error
+  de-capture:
+    needs: g2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PAPER2_RUNNER_LABEL: ubuntu-24.04
+    steps:
+      - name: Set temporary paths
+        shell: bash
+        run: |
+          echo "PYTHONPYCACHEPREFIX=$RUNNER_TEMP/pycache" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/work" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/receipts"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - name: Numeric capture and empirical-table scale gate
+        run: python -B -m src.paper2.verify.qualification monitor de-capture --work "$RUNNER_TEMP/work" --receipts "$RUNNER_TEMP/receipts"
+      - name: Small qualification receipts only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: model-qualification-de-capture-${{ github.run_id }}
+          path: ${{ runner.temp }}/receipts/
+          if-no-files-found: error
